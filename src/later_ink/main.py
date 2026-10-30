@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -22,6 +23,12 @@ from .connectors.instapaper import InstapaperConnector
 from .connectors.readwise import ReadwiseConnector
 from .connectors.wallabag import WallabagConnector
 from .epub import BUILD_VERSION, build_epub
+from .matins import config as matins_config
+from .matins import routes as matins_routes
+from .matins import scheduler as matins_scheduler
+from .matins.db import MatinsStore
+from .matins.issues import IssueService
+from .matins.tenant import TenantReader, build_tenant_reader
 from .payments import verify_checkout_session
 from .ratelimit import DurableLimiter, MemoryLimiter
 from .store import RESERVED_PATHS, Store
@@ -44,8 +51,11 @@ RATE_EVENT_MAX_AGE = 3600.0
 
 # Single-user (self-host) connectors, keyed by connector name
 _connectors: dict[str, Connector] = {}
-# Multi-tenant connector cache, keyed by Readwise token
-_tenant_connectors: OrderedDict[str, ReadwiseConnector] = OrderedDict()
+# Multi-tenant connector cache, keyed by catalogue secret. Keyed by secret
+# rather than by upstream token because a Matins catalogue can exist with no
+# upstream account at all (feeds + saved queue only), and every such catalogue
+# would otherwise share one cache entry.
+_tenant_connectors: OrderedDict[str, TenantReader] = OrderedDict()
 
 
 def _derive_csrf_key(encryption_key: str) -> bytes:
@@ -137,13 +147,36 @@ async def lifespan(app: FastAPI):
     instapaper_cfg = config.get_instapaper_config()
     if instapaper_cfg:
         _connectors["instapaper"] = InstapaperConnector(**instapaper_cfg)
-    yield
-    for c in _connectors.values():
-        await c.close()
-    _connectors.clear()
-    for c in _tenant_connectors.values():
-        await c.close()
-    _tenant_connectors.clear()
+
+    # Matins state. Shares the same SQLite file and Fernet key as the user
+    # store; its tables are disjoint, so the two classes never contend over
+    # schema.
+    app.state.matins = MatinsStore(config.get_database_path(), fernet)
+    app.state.issues = IssueService(
+        app.state.matins,
+        matins_config.get_issues_dir(config.get_database_path()),
+    )
+    app.state.tenant_reader = _tenant_connector
+
+    scheduler_task: asyncio.Task | None = None
+    if matins_config.scheduler_enabled():
+        scheduler_task = asyncio.create_task(matins_scheduler.run_forever(app))
+
+    try:
+        yield
+    finally:
+        if scheduler_task is not None:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        for c in _connectors.values():
+            await c.close()
+        _connectors.clear()
+        for c in _tenant_connectors.values():
+            await c.close()
+        _tenant_connectors.clear()
 
 
 app = FastAPI(
@@ -153,6 +186,10 @@ app = FastAPI(
     redoc_url=None,
     lifespan=lifespan,
 )
+
+# Registered before the catch-all tenant routes below, so /{secret}/issues/
+# resolves here rather than to a connector folder lookup.
+app.include_router(matins_routes.router)
 
 
 # Paths whose responses are the same for everyone and safe for a shared cache.
@@ -312,15 +349,18 @@ async def security_headers(request: Request, call_next):
     return response
 
 
-async def _tenant_connector(token: str) -> ReadwiseConnector:
-    conn = _tenant_connectors.get(token)
+async def _tenant_connector(secret: str) -> TenantReader:
+    """Cached reader for one catalogue: saved queue, feeds, and Readwise if the
+    user supplied a token. Keyed by secret — see the cache comment above."""
+    conn = _tenant_connectors.get(secret)
     if conn is None:
-        conn = ReadwiseConnector(token)
-        _tenant_connectors[token] = conn
+        token = app.state.store.get_token(secret)
+        conn = build_tenant_reader(secret, token or None, app.state.matins)
+        _tenant_connectors[secret] = conn
         while len(_tenant_connectors) > MAX_TENANT_CONNECTORS:
             _, evicted = _tenant_connectors.popitem(last=False)
             await evicted.close()
-    _tenant_connectors.move_to_end(token)
+    _tenant_connectors.move_to_end(secret)
     return conn
 
 
@@ -560,7 +600,8 @@ async def start_get(session_id: str | None = Query(None)):
 
 @app.post("/start", response_class=HTMLResponse)
 async def start_post(
-    readwise_token: str = Form(...),
+    # Optional since Matins: a catalogue can be feeds and saved links only.
+    readwise_token: str = Form(""),
     session_id: str | None = Form(None),
 ):
     error = await _check_payment(session_id)
@@ -568,7 +609,7 @@ async def start_post(
         return HTMLResponse(pages.start_form(None, error), status_code=403)
 
     readwise_token = readwise_token.strip()
-    if not readwise_token or not await readwise.validate_token(readwise_token):
+    if readwise_token and not await readwise.validate_token(readwise_token):
         return HTMLResponse(
             pages.start_form(session_id, "That token was rejected by Readwise. Double-check it and try again."),
             status_code=400,
@@ -722,10 +763,10 @@ async def tenant_regenerate(secret: str, request: Request, csrf: str | None = Fo
 
 @app.post("/{secret}/delete", response_class=HTMLResponse)
 async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(None)):
-    token = _resolve_secret(secret, request)
+    _resolve_secret(secret, request)
     _require_csrf(secret, csrf)
     app.state.store.delete_user(secret)
-    conn = _tenant_connectors.pop(token, None)
+    conn = _tenant_connectors.pop(secret, None)
     if conn is not None:
         await conn.close()
     return pages.deleted()
@@ -733,13 +774,19 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
 
 @app.api_route("/{secret}/", methods=["GET", "HEAD"])
 async def tenant_root(secret: str, request: Request):
-    token = _resolve_secret(secret, request)
-    c = await _tenant_connector(token)
+    _resolve_secret(secret, request)
+    c = await _tenant_connector(secret)
+    entries = [
+        *await _catalog_entries(c),
+        # The issues shelf is served by matins.routes, not by a connector: an
+        # issue is a built artefact, not an upstream folder.
+        Folder(id="issues", title="Issues", description="Composed editions"),
+    ]
     return Response(
         content=opds.folder_catalog(
             _feed_id(secret),
             "Later.Ink",
-            await _catalog_entries(c),
+            entries,
             base=f"/{secret}",
             start_href=f"/{secret}/",
             search_href=f"/{secret}/search.xml",
@@ -751,8 +798,8 @@ async def tenant_root(secret: str, request: Request):
 
 @app.get("/{secret}/articles/{article_id}.epub")
 async def tenant_epub(secret: str, article_id: str, request: Request):
-    token = _resolve_secret(secret, request)
-    c = await _tenant_connector(token)
+    _resolve_secret(secret, request)
+    c = await _tenant_connector(secret)
     return await _epub_response(
         c, article_id, cache=request.app.state.epub_cache, cache_user=secret
     )
@@ -776,8 +823,8 @@ async def tenant_search(
     q: str = Query(""),
     cursor: str | None = Query(None),
 ):
-    token = _resolve_secret(secret, request)
-    c = await _tenant_connector(token)
+    _resolve_secret(secret, request)
+    c = await _tenant_connector(secret)
     return await _search_response(
         c,
         q,
@@ -797,8 +844,8 @@ async def tenant_folder(
     request: Request,
     cursor: str | None = Query(None),
 ):
-    token = _resolve_secret(secret, request)
-    c = await _tenant_connector(token)
+    _resolve_secret(secret, request)
+    c = await _tenant_connector(secret)
     return await _folder_response(
         c,
         folder_id,

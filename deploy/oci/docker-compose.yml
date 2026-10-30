@@ -1,0 +1,61 @@
+# Matins on a single OCI free-tier VM.
+#
+# Two containers: the app and Caddy. Caddy is here for TLS and for the two
+# hostnames (matins.nilleb.co and .com) pointing at one service; it terminates
+# HTTPS and proxies to the app over the compose network, so the app never
+# publishes a port.
+#
+# Secrets are NOT in this file. They come from the env file on the VM
+# (/srv/matins/env, chmod 600, outside the repo) — see env.example.
+
+services:
+  matins:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: matins:local
+    restart: unless-stopped
+    env_file:
+      - /srv/matins/env
+    environment:
+      DATABASE_PATH: /data/app.db
+      ISSUES_DIR: /data/issues
+      # Behind Caddy, which sets the forwarded headers. Only enable this when
+      # the proxy is the only way in — see the app's config.trust_proxy_headers.
+      TRUST_PROXY_HEADERS: "1"
+      BASE_URL: https://matins.nilleb.co
+      TZ: Europe/Paris
+    volumes:
+      - matins-data:/data
+    # No ports: reachable only through the proxy network.
+    networks: [web]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    # Index digest, resolved 2026-10-30. Dependabot does not manage this
+    # file; re-resolve with: docker buildx imagetools inspect caddy:2.10-alpine
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    depends_on: [matins]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [web]
+
+networks:
+  web:
+
+volumes:
+  matins-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,141 @@
+# Deploying Matins on OCI
+
+Target: one free-tier VM, two hostnames (`matins.nilleb.co`, `matins.nilleb.com`)
+on the same instance, TLS by Caddy, state on a Docker volume.
+
+## 1. DNS
+
+`dns-zones/` (in the vault, not in this repo) already carries the records, gated
+on a variable so nothing is published until you supply the IP:
+
+```hcl
+# nilleb_co.tf / nilleb_com.tf
+resource "cloudflare_record" "nilleb_co_matins" {
+  count           = var.matins_ip == "" ? 0 : 1
+  zone_id         = data.cloudflare_zone.nilleb_co.id
+  name            = "matins"
+  type            = "A"
+  content         = var.matins_ip
+  proxied         = false   # keep false for Caddy's automatic TLS
+  allow_overwrite = true
+}
+```
+
+```bash
+cd ~/dev/nillebco/dns-zones
+terraform apply -var="matins_ip=<PUBLIC_IP>"
+```
+
+Proxied stays `false` on purpose: with Cloudflare in front, Let's Encrypt's
+HTTP-01 challenge never reaches Caddy. If you want the proxy (WAF, caching),
+switch Caddy to DNS-01 with the Cloudflare plugin instead.
+
+## 2. Firewall
+
+Open 80 and 443 on the OCI VCN security list and on the instance's own iptables
+(OCI images ship a REJECT rule by default):
+
+```bash
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 80 -j ACCEPT
+sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 443 -j ACCEPT
+sudo netfilter-persistent save    # or iptables-services / Oracle's persistence
+```
+
+## 3. The VM
+
+```bash
+sudo mkdir -p /srv/matins && sudo chown "$USER" /srv/matins
+git clone git@github.com:nilleb/matins.git /srv/matins/app   # or a release tarball
+cd /srv/matins/app/deploy/oci
+
+cp env.example /srv/matins/env
+chmod 600 /srv/matins/env
+# Edit /srv/matins/env: ENCRYPTION_KEY, ADMIN_TOKEN, SMTP if wanted.
+```
+
+## 4. Build and start
+
+```bash
+cd /srv/matins/app
+docker compose -f deploy/oci/docker-compose.yml up -d --build
+docker compose -f deploy/oci/docker-compose.yml ps
+curl -fsS https://matins.nilleb.co/healthz
+```
+
+First start takes a minute: the image builds the wheel from the hash-pinned
+lockfiles, and Caddy issues the certificate on first request.
+
+## 5. First account
+
+1. Open `https://matins.nilleb.co/start`.
+2. Leave the Readwise token empty (feeds-only) or paste one.
+3. Save the catalogue URL — four dictionary words, typeable on e-ink.
+4. Open `/<secret>/settings`, add feeds, set the schedule and timezone, and
+   optionally an email address and webhook URL.
+5. Add `https://matins.nilleb.co/<secret>/` as an OPDS catalogue in KOReader
+   (or CrossPoint's OPDS browser).
+6. Press **Compose an issue now** once to check the result end to end.
+
+## Operations
+
+```bash
+docker compose -f deploy/oci/docker-compose.yml logs -f matins
+curl -fsS https://matins.nilleb.co/health            # config summary, no secrets
+docker compose -f deploy/oci/docker-compose.yml exec matins \
+  ls -la /data /data/issues                          # volumes and issues
+```
+
+Force an issue for one catalogue (bypasses the schedule and the "already built
+today" check):
+
+```bash
+curl -fsS -X POST "https://matins.nilleb.co/admin/issues/run?secret=<secret>&force=1" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+### Backup
+
+Everything that matters is the volume plus the env file:
+
+```bash
+docker run --rm -v matins_matins-data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/matins-$(date +%F).tgz -C /data .
+```
+
+The database is SQLite in WAL mode, so copy the `-wal` and `-shm` sidecars too
+(tar of the whole directory does this). `ENCRYPTION_KEY` is not in the backup —
+store it in the password manager, or the backup restores into an app that cannot
+decrypt any stored token.
+
+### Upgrade
+
+```bash
+cd /srv/matins/app && git pull && \
+  docker compose -f deploy/oci/docker-compose.yml up -d --build
+```
+
+Upstream (`brendanlefebvre/later-ink`) stays as the `upstream` remote, so a
+Later.Ink release can be merged with `git fetch upstream && git merge
+upstream/main`. The Matins additions live in `src/later_ink/matins/` plus a
+handful of hooks in `main.py`, which keeps those merges small.
+
+## Supply chain
+
+Inherited from upstream and deliberately kept:
+
+- Runtime dependencies are pinned **and hashed** (`requirements*.txt`), built
+  with `pip --require-hashes`. CI installs from the lockfiles, not from
+  `pyproject.toml` ranges.
+- The base image in `Dockerfile` is pinned by **multi-arch index digest**;
+  `.github/dependabot.yml` refreshes the digest weekly.
+- The wheel is built in a first stage so the PEP 517 backend never ships.
+- `pip-audit` runs against all four lockfiles in CI.
+
+Matins adds **no runtime dependencies**. RSS parsing, extraction, scheduling,
+HMAC signing and SMTP all use `lxml`/stdlib, which is the main reason the
+feature set is shaped the way it is. Caddy is the one new image and is pinned by
+index digest in `docker-compose.yml`; re-resolve it when you bump it:
+
+```bash
+docker buildx imagetools inspect caddy:2.10-alpine | grep Digest
+```

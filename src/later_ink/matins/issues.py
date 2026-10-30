@@ -1,0 +1,280 @@
+"""Selection and assembly of one day's issue.
+
+The editorial rules are deliberately few and legible, because the failure mode
+of an automated newspaper is not "no articles" — it is "forty articles, all from
+the same site, none of them read". So: newest first, a per-feed cap, a word
+budget for the whole issue, and a hard exclusion of anything already printed.
+
+Everything here is idempotent per day: the scheduler asks "has this user got an
+issue for today's local day?" before doing any work, and the dedupe table covers
+the case where two runs race.
+"""
+
+import hashlib
+import logging
+import os
+from datetime import UTC, datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from .. import config as app_config
+from ..connectors.base import ArticleUnavailable, UpstreamError
+from ..epub import BuildResult
+from . import config, notify, webhooks
+from .db import Issue, MatinsStore
+from .issue_epub import IssueItem, build_issue
+
+logger = logging.getLogger(__name__)
+
+SAVED_SECTION = "Saved for later"
+
+# Used when a feed gives no word count at all. Low enough that a silent feed
+# cannot monopolise the budget, high enough that it is not excluded for free.
+DEFAULT_ITEM_WORDS = 400
+
+
+class IssueService:
+    def __init__(self, store: MatinsStore, issues_dir: Path):
+        self.store = store
+        self.issues_dir = Path(issues_dir)
+
+    def issues_for(self, secret: str) -> list[Issue]:
+        return self.store.list_issues(secret)
+
+    def issue_path(self, secret: str, issue_id: str) -> Path:
+        """Where one issue lives on disk.
+
+        The directory is derived from the secret, and the filename from an id
+        that came out of the database — never from the request path. A download
+        route that built a filesystem path out of user input would be a
+        traversal bug waiting for a clever id.
+        """
+        issue = self.store.get_issue(secret, issue_id)
+        if issue is None:
+            raise KeyError(issue_id)
+        return Path(issue.path)
+
+    async def build(
+        self,
+        *,
+        secret: str,
+        reader,
+        local_day: str,
+        now: datetime | None = None,
+    ) -> Issue | None:
+        now = now or datetime.now(UTC)
+        candidates = await self._select(secret, reader, now)
+        if not candidates:
+            return None
+
+        items: list[IssueItem] = []
+        printed: list[tuple[str, object, str]] = []
+        for source_name, article, section in candidates:
+            try:
+                _article, html = await reader.get_article_html(
+                    reader.decorate_id(source_name, article.id)
+                )
+            except (ArticleUnavailable, UpstreamError, KeyError) as e:
+                # One dead link does not cancel the edition. The scheduled run
+                # is the only chance the user gets today.
+                logger.info("skipping %r for %s: %s", article.title, local_day, e)
+                continue
+            items.append(
+                IssueItem(
+                    title=article.title,
+                    html=html,
+                    section=section,
+                    author=article.author,
+                    source_url=article.url,
+                    image_url=article.image_url,
+                    word_count=_words(html),
+                )
+            )
+            printed.append((source_name, article, section))
+
+        if not items:
+            return None
+
+        title = f"Matins — {datetime.fromisoformat(local_day):%A %d %B %Y}"
+        build = await build_issue(
+            title=title,
+            issue_date=now,
+            items=items,
+            language=_language(items),
+        )
+        issue_id = self.store.new_issue_id()
+        path = self._write(secret, issue_id, build.result)
+        word_count = sum(item.word_count for item in items)
+        issue = self.store.record_issue(
+            issue_id=issue_id,
+            secret=secret,
+            title=title,
+            local_day=local_day,
+            path=str(path),
+            article_count=len(items),
+            word_count=word_count,
+            items=[
+                (
+                    reader.decorate_id(source, article.id),
+                    article.title,
+                    article.url,
+                    section,
+                )
+                for source, article, section in printed
+            ],
+        )
+        # Only mark consumed what actually made it into the file — a saved link
+        # whose page failed to extract stays in the queue for tomorrow.
+        saved_ids = [int(article.id) for source, article, _ in printed if source == "later"]
+        self.store.consume_saved(secret, saved_ids, issue_id)
+        self._prune(secret)
+        logger.info(
+            "built issue %s for a catalogue: %d articles, %d words",
+            issue_id,
+            issue.article_count,
+            issue.word_count,
+        )
+        return issue
+
+    async def deliver(self, secret: str, issue: Issue) -> None:
+        """Fire the webhook and the notification email, if configured.
+
+        Runs after the issue is committed, so a failed delivery never means a
+        missing issue — the reader can always pull it. Failures are logged, not
+        raised: the caller is usually a scheduler loop that must keep going.
+        """
+        delivery = self.store.get_delivery(secret)
+        if delivery is None:
+            return
+        catalog_url = f"{self._base_url()}/{secret}/issues/"
+        if delivery.webhook_url:
+            payload = webhooks.issue_payload(issue, catalog_url)
+            ok = await webhooks.deliver(
+                delivery.webhook_url, delivery.webhook_secret, payload
+            )
+            if not ok:
+                logger.warning("webhook for %s did not succeed", issue.id)
+        if delivery.email:
+            await notify.send_issue_notification(delivery.email, issue, catalog_url)
+
+    async def _select(
+        self, secret: str, reader, now: datetime
+    ) -> list[tuple[str, object, str]]:
+        """Ordered (source, article, section) candidates.
+
+        Saved items come first and are exempt from the per-feed cap: a link the
+        user deliberately queued is a stronger signal than anything a feed
+        pushed at them."""
+        selected: list[tuple[str, object, str]] = []
+        budget = config.get_issue_max_words()
+        max_articles = config.get_issue_max_articles()
+
+        queue = reader.sources.get("later")
+        if queue is not None:
+            try:
+                saved, _ = await queue.list_articles("inbox")
+            except (UpstreamError, KeyError):
+                saved = []
+            for article in saved[: config.get_issue_max_saved()]:
+                cost = article.word_count or DEFAULT_ITEM_WORDS
+                if selected and budget - cost < 0:
+                    break
+                selected.append(("later", article, SAVED_SECTION))
+                budget -= cost
+
+        feeds = reader.sources.get("rss")
+        if feeds is not None:
+            try:
+                folders = await feeds.list_folders()
+            except UpstreamError:
+                folders = []
+            for folder in folders:
+                if len(selected) >= max_articles or budget <= 0:
+                    break
+                try:
+                    articles, _ = await feeds.list_articles(folder.id)
+                except UpstreamError as e:
+                    logger.info("feed %s unavailable: %s", folder.title, e)
+                    continue
+                # Dedupe keys are the catalogue-wide ids (prefixed), not the
+                # raw connector ids — see TenantReader.decorate_id. Comparing
+                # raw ids against the stored prefixed ones silently reprints
+                # every article every day.
+                keys = {a.id: reader.decorate_id("rss", a.id) for a in articles}
+                already = self.store.issued_articles(secret, list(keys.values()))
+                fresh = [
+                    a
+                    for a in articles
+                    if keys[a.id] not in already
+                    and _fresh(a, now, config.get_issue_window_hours())
+                ]
+                per_feed = 0
+                for article in fresh:
+                    if per_feed >= config.get_issue_max_per_feed():
+                        break
+                    if len(selected) >= max_articles:
+                        break
+                    cost = article.word_count or DEFAULT_ITEM_WORDS
+                    if budget - cost < 0:
+                        break
+                    selected.append(("rss", article, folder.title))
+                    budget -= cost
+                    per_feed += 1
+
+        return selected
+
+    def _write(self, secret: str, issue_id: str, result: BuildResult) -> Path:
+        directory = self.issues_dir / hashlib.sha1(secret.encode()).hexdigest()[:16]
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{issue_id}.epub"
+        # Write beside the target and rename: a reader that opens the catalogue
+        # mid-build must never see a half-written EPUB.
+        tmp = directory / f".{issue_id}.tmp"
+        tmp.write_bytes(result.data)
+        os.replace(tmp, path)
+        return path
+
+    def _prune(self, secret: str) -> None:
+        retention = config.get_issue_retention()
+        if retention <= 0:
+            return
+        issues = self.store.list_issues(secret, limit=10_000)
+        for issue in issues[retention:]:
+            try:
+                Path(issue.path).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("could not remove %s", issue.path, exc_info=True)
+            self.store.delete_issue(secret, issue.id)
+
+    def _base_url(self) -> str:
+        return app_config.get_base_url()
+
+
+def local_day(tz_name: str, now: datetime | None = None) -> str:
+    """The user's calendar day, as YYYY-MM-DD.
+
+    Computed in their timezone, not the server's: "today's paper" is a local
+    claim, and a UTC server would roll the day over mid-morning in Auckland."""
+    now = now or datetime.now(UTC)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(config.get_default_timezone())
+    return now.astimezone(tz).date().isoformat()
+
+
+def _fresh(article, now: datetime, hours: int) -> bool:
+    if article.content_date is None:
+        return True  # a feed that dates nothing still deserves to be read
+    reference = now.replace(tzinfo=None)
+    return (reference - article.content_date).total_seconds() <= hours * 3600
+
+
+def _words(html: str) -> int:
+    from .extract import word_count
+
+    return word_count(html)
+
+
+def _language(items: list[IssueItem]) -> str:
+    return "en"

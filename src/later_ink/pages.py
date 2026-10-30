@@ -513,14 +513,15 @@ def start_form(session_id: str | None, error: str | None = None) -> str:
         f"""
 <h1>Set up your catalog</h1>
 {err}
-<p class="small">Paste your Readwise access token. Get it at
-<a class="inline" href="https://readwise.io/access_token">readwise.io/access_token</a>.</p>
+<p class="small">Optionally paste your Readwise access token (get it at
+<a class="inline" href="https://readwise.io/access_token">readwise.io/access_token</a>).
+You can skip it: Matins works with your own RSS feeds and saved links alone.</p>
 <form method="post" action="/start">
 {hidden}
-<p><input type="password" name="readwise_token" placeholder="Readwise access token" required></p>
+<p><input type="password" name="readwise_token" placeholder="Readwise access token (optional)"></p>
 <p><button class="btn" type="submit">Create my catalog</button></p>
 </form>
-<p class="muted">Your token is encrypted at rest with a key held outside the
+<p class="muted">A token is encrypted at rest with a key held outside the
 database, never logged, and only ever sent to Readwise.</p>
 """,
     )

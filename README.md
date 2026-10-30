@@ -32,6 +32,40 @@ can be turned on for cross-device reading-progress sync; see below.)
 > send-to-Kindle; the sweet spot here is Kobo, Boox, and other non-Kindle
 > e-ink.)
 
+---
+
+## Matins
+
+This repository is a fork of Later.Ink, extended into **Matins**: a multi-user
+service that composes a dated **issue** — your saved links plus everything new
+in your RSS feeds — into one EPUB, and delivers it to an e-reader over OPDS.
+
+What is added on top of Later.Ink:
+
+- **Feeds as a source.** RSS 2.0 and Atom, parsed with `lxml` (no new
+  dependency), with per-feed and whole-issue caps so one prolific site cannot
+  become the newspaper.
+- **A built-in read-later queue**, so a catalogue no longer requires a Readwise,
+  Wallabag or Instapaper account.
+- **Issues.** A composed, dated EPUB with sections and a grouped table of
+  contents, byte-identical between downloads (KOReader progress sync) and
+  retained per user.
+- **Delivery as a signal, never as content.** An `issue.ready` webhook, signed
+  HMAC-SHA256 (`X-Matins-Signature: t=…,v1=…`), and an optional notification
+  email containing a link and nothing else. The issue itself is only ever
+  pulled over OPDS.
+- **Per-user settings page** at `/<secret>/settings` for feeds, schedule,
+  timezone, webhook and email, and a `POST /<secret>/save` endpoint for share
+  shortcuts.
+
+Deployment for a single OCI VM (compute + Caddy + DNS) is in
+[`deploy/oci/`](deploy/oci/README.md). Architecture, data model and the
+security decisions behind them are in [`docs/matins.md`](docs/matins.md).
+
+The rest of this README documents Later.Ink itself, which Matins still does.
+
+---
+
 ## Self-host quickstart
 
 > **Upgrading from ≤0.3.x?** The internal package was renamed for the brand:

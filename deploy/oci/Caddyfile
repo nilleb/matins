@@ -1,0 +1,36 @@
+# Both hostnames serve the same instance. Keeping two zones pointed here means
+# a reader that types the wrong TLD still lands on their catalogue.
+#
+# Replace the addresses below with the ones you actually use. The app's
+# canonical-host redirect is off unless CANONICAL_HOST is set, so both names
+# answering directly is the expected setup.
+
+matins.nilleb.co, matins.nilleb.com {
+	encode zstd gzip
+
+	# Caddy gets and renews the certificate over HTTP-01/TLS-ALPN. That only
+	# works while the DNS record is NOT proxied by Cloudflare — an orange-cloud
+	# record terminates TLS at Cloudflare and Caddy never sees the challenge.
+	# If you enable the proxy, switch to the DNS-01 challenge (caddy-dns/
+	# cloudflare plugin) or a Cloudflare Origin CA certificate instead.
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# OPDS downloads are the bulk of the traffic; leave body limits alone.
+	reverse_proxy matins:8000 {
+		# The app rate-limits by client address. Caddy is the only hop, so its
+		# X-Forwarded-For is trustworthy; the app only honors it because
+		# TRUST_PROXY_HEADERS=1 is set in compose.
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
