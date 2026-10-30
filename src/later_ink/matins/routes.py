@@ -353,8 +353,10 @@ def _render_settings(request, secret, *, notice=None, error=None, feeds_override
         csrf=_csrf_token(secret),
         feeds=feeds,
         feed_lines=feeds_override if feeds_override is not None else "\n".join(feeds),
-        email=delivery.email if delivery else "",
-        webhook_url=delivery.webhook_url if delivery else "",
+        # `or ""` rather than a truthiness check: a saved-but-blank field is
+        # stored as NULL, and escape(None) is a 500 on the page that saves it.
+        email=(delivery.email if delivery else None) or "",
+        webhook_url=(delivery.webhook_url if delivery else None) or "",
         schedule=delivery.schedule if delivery else config.get_default_schedule(),
         timezone=delivery.timezone if delivery else config.get_default_timezone(),
         enabled=bool(delivery.enabled) if delivery else True,

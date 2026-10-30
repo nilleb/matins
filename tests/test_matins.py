@@ -394,6 +394,31 @@ def test_settings_adds_feeds_and_saves_delivery(client):
     assert delivery.webhook_secret == "whsec"
 
 
+def test_settings_render_after_saving_blank_optional_fields(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    resp = client.post(
+        f"/{secret}/settings",
+        data={
+            "csrf": csrf,
+            "feeds": "https://example.com/feed",
+            "email": "",
+            "webhook_url": "",
+            "webhook_secret": "",
+            "schedule": "07:00",
+            "timezone": "Europe/Paris",
+            "enabled": "1",
+        },
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+    # Blank optional fields are stored as NULL; rendering the page that saved
+    # them must not blow up on escape(None).
+    page = client.get(f"/{secret}/settings?saved=1")
+    assert page.status_code == 200
+    assert "feeds" in page.text
+
+
 def test_save_endpoint_queues_a_link(client):
     secret = _signup_without_readwise(client)
     resp = client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
