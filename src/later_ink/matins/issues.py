@@ -64,6 +64,7 @@ class IssueService:
     ) -> Issue | None:
         now = now or datetime.now(UTC)
         candidates = await self._select(secret, reader, now)
+        logger.info("issue for %s on %s: %d candidates", _mask(secret), local_day, len(candidates))
         if not candidates:
             return None
 
@@ -93,6 +94,9 @@ class IssueService:
             printed.append((source_name, article, section))
 
         if not items:
+            logger.info(
+                "no item survived fetching for %s on %s", _mask(secret), local_day
+            )
             return None
 
         title = f"Matins — {datetime.fromisoformat(local_day):%A %d %B %Y}"
@@ -278,3 +282,8 @@ def _words(html: str) -> int:
 
 def _language(items: list[IssueItem]) -> str:
     return "en"
+
+
+def _mask(secret: str) -> str:
+    """Logs name a catalogue without carrying its secret."""
+    return f"catalogue …{secret[-4:]}" if len(secret) > 4 else "catalogue"

@@ -74,6 +74,13 @@ def _derive_csrf_key(encryption_key: str) -> bytes:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Uvicorn configures its own loggers, not the root one, so without this the
+    # app's INFO lines (issue composition, skipped items, delivery failures) go
+    # nowhere and a scheduled run is impossible to debug from `docker logs`.
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(levelname)s %(name)s: %(message)s",
+    )
     key = config.get_encryption_key()
     ephemeral = key is None
     if ephemeral:
