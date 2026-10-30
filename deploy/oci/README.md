@@ -119,6 +119,66 @@ Later.Ink release can be merged with `git fetch upstream && git merge
 upstream/main`. The Matins additions live in `src/later_ink/matins/` plus a
 handful of hooks in `main.py`, which keeps those merges small.
 
+## Notification email (Brevo)
+
+SMTP is optional: with no `SMTP_HOST`/`SMTP_FROM`, `notify.py` returns False and
+the webhook still fires. To enable it, add these to `/srv/matins/env` (the
+password comes from the password manager, not the repo):
+
+```
+SMTP_HOST=smtp-relay.brevo.com
+SMTP_PORT=587
+SMTP_USERNAME=b0ce0f001@smtp-brevo.com
+SMTP_PASSWORD=<Brevo SMTP key>
+SMTP_FROM=hello@nilleb.com
+SMTP_TLS=starttls
+```
+
+Three things that cost an hour if you meet them cold:
+
+- **`525 Unauthorized IP address`** means the SMTP key is IP-allowlisted and the
+  instance is not on it. Authorise the instance's *egress* IPv4 (the public IP,
+  because outbound traffic is SNAT'd through the internet gateway). This box has
+  no global IPv6 and `smtp-relay.brevo.com` publishes A records only, so one
+  address is the whole list. A Reserved public IP keeps that address stable if
+  the instance is ever rebuilt.
+- **DKIM on Brevo is two CNAMEs**, `brevo1._domainkey` and `brevo2._domainkey`,
+  delegating to `b1/b2.<domain-with-dashes>.dkim.brevo.com`. There is no
+  `mail._domainkey` TXT to look for — that was the old scheme, and hunting for
+  it makes a working setup look broken.
+- **No SPF change is needed** when DKIM is aligned: DMARC passes on DKIM, and
+  Brevo's Return-Path is on its own domain, so the apex SPF is not in this path.
+  Do not add a second `v=spf1` TXT — that is a permerror.
+
+Verify credentials without composing an issue:
+
+```bash
+docker compose -f deploy/oci/docker-compose.yml exec -T matins python - <<'PY'
+import asyncio, os, smtplib
+from dataclasses import dataclass
+from later_ink.matins import notify
+
+s = smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"]), timeout=20)
+s.ehlo(); s.starttls(); s.ehlo()
+s.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"])
+print("auth ok"); s.quit()
+
+@dataclass
+class Issue:
+    id: str = "test"
+    title: str = "Matins — test"
+    article_count: int = 1
+    word_count: int = 250
+
+print("accepted" if asyncio.run(
+    notify.send_issue_notification("you@example.com", Issue(), "https://matins.example/x/")
+) else "failed")
+PY
+```
+
+The message is deliberately a subject line and a link — no attachment, so there
+is no Send-to-Kindle path and no size limit to maintain.
+
 ## Supply chain
 
 Inherited from upstream and deliberately kept:
