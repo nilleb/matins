@@ -1,5 +1,10 @@
 # Matins on a single OCI free-tier VM.
 #
+# Project name pinned so containers and volumes are `matins-*` regardless of the
+# directory the compose file is invoked from.
+name: matins
+
+#
 # Two containers: the app and Caddy. Caddy is here for TLS and for the two
 # hostnames (matins.nilleb.co and .com) pointing at one service; it terminates
 # HTTPS and proxies to the app over the compose network, so the app never
