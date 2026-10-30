@@ -629,6 +629,24 @@ def test_landing_lists_the_catalogues_this_browser_has(client):
     assert client.get(f"/{secret}/").status_code == 200
 
 
+def test_preview_and_issue_use_the_feed_title_not_its_url(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
+        follow_redirects=False,
+    )
+    preview = client.get(f"/{secret}/issues/preview")
+    assert "Example Feed" in preview.text
+    assert "https://example.com/feed" not in preview.text
+
+    client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    with client.app.state.matins._conn() as conn:
+        sections = {r["section"] for r in conn.execute("select section from issue_items")}
+    assert sections == {"Example Feed"}
+
+
 def test_preview_shows_the_selection_without_composing(client):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)

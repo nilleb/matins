@@ -235,6 +235,13 @@ class IssueService:
                 # raw ids against the stored prefixed ones silently reprints
                 # every article every day.
                 keys = {a.id: reader.decorate_id("rss", a.id) for a in articles}
+                # The catalogue adopted the feed's own title while parsing it
+                # above (RssConnector._load renames an untitled subscription), so
+                # re-read it: the Folder we listed a moment ago still carries the
+                # URL, and that URL would otherwise become this section's name in
+                # both the preview and the issue's table of contents.
+                stored = self.store.get_feed(secret, folder.id)
+                section = (stored.title if stored else "") or folder.title
                 already = self.store.issued_articles(secret, list(keys.values()))
                 fresh = [
                     a
@@ -251,7 +258,7 @@ class IssueService:
                     cost = article.word_count or DEFAULT_ITEM_WORDS
                     if budget - cost < 0:
                         break
-                    selected.append(Candidate("rss", article, folder.title))
+                    selected.append(Candidate("rss", article, section))
                     budget -= cost
                     per_feed += 1
 
