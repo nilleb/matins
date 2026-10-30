@@ -337,6 +337,21 @@ class MatinsStore:
                 "DELETE FROM issues WHERE id = ? AND secret = ?", (issue_id, secret)
             )
 
+    def delete_user_data(self, secret: str) -> None:
+        """Remove everything Matins stores for a catalogue.
+
+        Deleting a catalogue has to mean deleting the feeds someone follows,
+        the links they saved, and the issues already printed — otherwise "delete
+        my catalogue" leaves a readable record of their reading behind, which is
+        not what the button says.
+        """
+        with self._conn() as conn:
+            conn.execute("DELETE FROM issue_items WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM issues WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM saved WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM feeds WHERE secret = ?", (secret,))
+            conn.execute("DELETE FROM delivery WHERE secret = ?", (secret,))
+
     def has_issue_for_day(self, secret: str, local_day: str) -> bool:
         with self._conn() as conn:
             row = conn.execute(

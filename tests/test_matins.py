@@ -529,6 +529,33 @@ def test_issue_download_is_scoped_to_its_catalogue(client):
     assert client.get(f"/{second}/issues/{issue.id}.epub").status_code == 404
 
 
+def test_deleting_a_catalogue_removes_its_feeds_queue_and_issues(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
+        follow_redirects=False,
+    )
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+    client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    issue = client.app.state.matins.list_issues(secret)[0]
+    from pathlib import Path
+
+    path = Path(issue.path)
+    assert path.exists()
+
+    resp = client.post(f"/{secret}/delete", data={"csrf": csrf})
+    assert resp.status_code == 200
+    store = client.app.state.matins
+    assert store.list_feeds(secret) == []
+    assert store.list_saved(secret, include_consumed=True) == []
+    assert store.list_issues(secret) == []
+    assert store.get_delivery(secret) is None
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
 def test_admin_run_requires_token(client, monkeypatch):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)

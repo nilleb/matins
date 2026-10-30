@@ -773,6 +773,7 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
     _resolve_secret(secret, request)
     _require_csrf(secret, csrf)
     app.state.store.delete_user(secret)
+    app.state.issues.forget(secret)
     conn = _tenant_connectors.pop(secret, None)
     if conn is not None:
         await conn.close()

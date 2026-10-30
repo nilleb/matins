@@ -13,6 +13,7 @@ the case where two runs race.
 import hashlib
 import logging
 import os
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -139,6 +140,17 @@ class IssueService:
             issue.word_count,
         )
         return issue
+
+    def forget(self, secret: str) -> None:
+        """Drop a catalogue's issues (files included) and its source settings.
+
+        Called when a user deletes their catalogue. Issue files are named after
+        a hash of the secret, so removing that directory is enough to take the
+        composed EPUBs with it.
+        """
+        directory = self.issues_dir / hashlib.sha1(secret.encode()).hexdigest()[:16]
+        shutil.rmtree(directory, ignore_errors=True)
+        self.store.delete_user_data(secret)
 
     async def deliver(self, secret: str, issue: Issue) -> None:
         """Fire the webhook and the notification email, if configured.
