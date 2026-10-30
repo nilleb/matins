@@ -17,3 +17,6 @@ docs/superpowers/
 # superpowers' working directory while it executes a plan: progress ledger,
 # task briefs, review packages. Scratch, specific to one machine and run.
 .superpowers/
+
+# Secret references are local to this machine.
+fnox.toml

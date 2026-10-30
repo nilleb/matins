@@ -17,9 +17,10 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .. import config as app_config
 from .. import opds
 from ..connectors.base import Article
-from . import config, pages
+from . import catalogues, config, pages
 from .issues import IssueService, local_day
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,31 @@ async def settings_post(
     return RedirectResponse(f"/{secret}/settings?saved=1", status_code=303)
 
 
+@router.get("/{secret}/issues/preview", response_class=HTMLResponse)
+async def issues_preview(secret: str, request: Request):
+    """The next issue's selection, without writing anything."""
+    _resolve(secret, request)
+    reader = await _reader(request, secret)
+    candidates = await _service(request).plan(secret, reader)
+    return HTMLResponse(
+        pages.preview_page(
+            secret=secret,
+            csrf=_csrf_token(secret),
+            candidates=[
+                {
+                    "title": c.article.title,
+                    "section": c.section,
+                    "source": c.source,
+                    "words": c.estimated_words,
+                }
+                for c in candidates
+            ],
+            window_hours=config.get_issue_window_hours(),
+            max_articles=config.get_issue_max_articles(),
+        )
+    )
+
+
 @router.post("/{secret}/issues/build", response_class=HTMLResponse)
 async def build_now(secret: str, request: Request, csrf: str = Form("")):
     _resolve(secret, request)
@@ -201,6 +227,16 @@ async def build_now(secret: str, request: Request, csrf: str = Form("")):
 
 
 # ------------------------------------------------------------ save-to-queue
+
+
+@router.post("/{secret}/forget")
+async def forget_catalogue(secret: str, request: Request, csrf: str = Form("")):
+    """Drop this catalogue from the browser's list. Not a deletion."""
+    _resolve(secret, request)
+    _require_csrf(secret, csrf)
+    response = RedirectResponse("/", status_code=303)
+    catalogues.forget(secret, request, response)
+    return response
 
 
 @router.post("/{secret}/save")
@@ -308,12 +344,36 @@ async def admin_run(request: Request, secret: str | None = None, force: int = 0)
 # -------------------------------------------------------------------- shared
 
 
-async def _build(request: Request, secret: str, day: str):
+async def _reader(request: Request, secret: str):
     try:
-        reader = await request.app.state.tenant_reader(secret)
+        return await request.app.state.tenant_reader(secret)
     except KeyError:
         raise HTTPException(404, "Unknown catalogue") from None
-    return await _service(request).build(secret=secret, reader=reader, local_day=day)
+
+
+async def _build(request: Request, secret: str, day: str):
+    return await _service(request).build(
+        secret=secret, reader=await _reader(request, secret), local_day=day
+    )
+
+
+def dashboard(request: Request, secret: str) -> str:
+    """HTML for `/{secret}/` when a browser asks for it. Called from main's
+    tenant root, which owns the route and the cookie."""
+    store = _store(request)
+    issues = [
+        (i.id, i.title, i.article_count, i.word_count)
+        for i in _service(request).issues_for(secret)[:5]
+    ]
+    return pages.dashboard_page(
+        secret=secret,
+        base_url=app_config.get_base_url(),
+        csrf=_csrf_token(secret),
+        feed_count=len(store.list_feeds(secret)),
+        saved_count=len(store.list_saved(secret)),
+        issues=issues,
+        latest=issues[0] if issues else None,
+    )
 
 
 def _feed_response(request, secret, articles, *, title, feed_id, epub_base):

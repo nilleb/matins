@@ -396,7 +396,12 @@ def _page(title: str, body: str, head_extra: str = "") -> str:
     )
 
 
-def landing(payment_link: str | None, free_signup: bool, base_url: str) -> str:
+def landing(
+    payment_link: str | None,
+    free_signup: bool,
+    base_url: str,
+    catalogues: list[str] | None = None,
+) -> str:
     if payment_link:
         cta = f'<a class="btn" href="{escape(payment_link)}">Get your catalog</a>'
         ghost = '<a class="link-ghost" href="#self-host">Or self-host it &darr;</a>'
@@ -434,9 +439,24 @@ def landing(payment_link: str | None, free_signup: bool, base_url: str) -> str:
         '<meta name="twitter:card" content="summary_large_image">'
         f'<meta name="description" content="{og_description}">'
     )
+    mine = ""
+    if catalogues:
+        links = "".join(
+            f'<a class="link-ghost" href="/{escape(secret)}/">{escape(secret)}</a>'
+            for secret in catalogues
+        )
+        mine = f"""
+<section class="hero">
+  <h2 class="eyebrow" style="margin-top:0">Your catalogues on this device</h2>
+  <div class="cta-row" style="flex-wrap:wrap">{links}</div>
+  <p class="small">Each opens the catalogue dashboard (settings, feeds, next issue).
+  The link itself is the key — anyone who has it can read the catalogue.</p>
+</section>
+"""
     return _page(
         "Later.Ink: your read-later queue, on e-ink",
         f"""
+{mine}
 <section class="hero">
   <h1>Your read-later queue,<br>on e-ink<span class="end">.</span></h1>
   <p class="lede">Later.Ink turns your <strong>Readwise Reader</strong>, <strong>Wallabag</strong>,
@@ -535,6 +555,8 @@ def success(catalog_url: str, secret: str, csrf: str) -> str:
 <p class="small">Add this URL to any OPDS reader; it's designed to be easy to type
 on an e-ink keyboard (all lowercase, no symbols except hyphens and slashes):</p>
 <span class="url-big">{escape(catalog_url)}</span>
+<p class="small"><a class="inline" href="/{escape(secret)}/">Open your catalogue dashboard &rarr;</a>
+&mdash; settings, feeds, and what would go into the next issue.</p>
 <h2 class="eyebrow">Example: KOReader setup</h2>
 <ol>
 <li>Open KOReader &rarr; tap the top menu &rarr; magnifying glass icon</li>

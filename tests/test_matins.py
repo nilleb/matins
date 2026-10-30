@@ -594,6 +594,69 @@ def test_deleting_a_catalogue_removes_its_feeds_queue_and_issues(client):
     assert not path.parent.exists()
 
 
+def test_browser_gets_a_dashboard_and_readers_get_opds(client):
+    secret = _signup_without_readwise(client)
+
+    html = client.get(f"/{secret}/", headers={"accept": "text/html"})
+    assert html.status_code == 200
+    assert html.headers["content-type"].startswith("text/html")
+    assert "Compose an issue now" in html.text
+    assert f"/{secret}/settings" in html.text
+    assert f"/{secret}/issues/preview" in html.text
+
+    # A reader asking for nothing (or for Atom) still gets the catalogue.
+    feed = client.get(f"/{secret}/", headers={"accept": "*/*"})
+    assert feed.headers["content-type"].startswith("application/atom+xml")
+    assert "<feed" in feed.text
+    atom = client.get(f"/{secret}/", headers={"accept": "application/atom+xml"})
+    assert "<feed" in atom.text
+
+
+def test_landing_lists_the_catalogues_this_browser_has(client):
+    secret = _signup_without_readwise(client)
+    landing = client.get("/")
+    assert "Your catalogues on this device" in landing.text
+    assert f'href="/{secret}/"' in landing.text
+
+    client.get(f"/{secret}/", headers={"accept": "text/html"})
+    csrf = _csrf(client, secret)
+    forgotten = client.post(
+        f"/{secret}/forget", data={"csrf": csrf}, follow_redirects=False
+    )
+    assert forgotten.status_code == 303
+    assert secret not in client.get("/").text
+    # Forgetting the browser entry does not touch the catalogue itself.
+    assert client.get(f"/{secret}/").status_code == 200
+
+
+def test_preview_shows_the_selection_without_composing(client):
+    secret = _signup_without_readwise(client)
+    csrf = _csrf(client, secret)
+
+    empty = client.get(f"/{secret}/issues/preview")
+    assert empty.status_code == 200
+    assert "Nothing is queued" in empty.text
+
+    client.post(
+        f"/{secret}/settings",
+        data={"csrf": csrf, "feeds": "https://example.com/feed", "schedule": "07:00"},
+        follow_redirects=False,
+    )
+    client.post(f"/{secret}/save", json={"url": "https://example.com/later"})
+
+    preview = client.get(f"/{secret}/issues/preview")
+    assert preview.status_code == 200
+    assert "First story" in preview.text
+    assert "Saved for later" in preview.text
+    assert "Read later" in preview.text or "later" in preview.text.lower()
+    # Previewing must not create an issue or consume the queue.
+    assert client.app.state.matins.list_issues(secret) == []
+    assert len(client.app.state.matins.list_saved(secret)) == 1
+
+    composed = client.post(f"/{secret}/issues/build", data={"csrf": csrf})
+    assert "Composed" in composed.text
+
+
 def test_admin_run_requires_token(client, monkeypatch):
     secret = _signup_without_readwise(client)
     csrf = _csrf(client, secret)

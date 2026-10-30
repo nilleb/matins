@@ -23,6 +23,7 @@ from .connectors.instapaper import InstapaperConnector
 from .connectors.readwise import ReadwiseConnector
 from .connectors.wallabag import WallabagConnector
 from .epub import BUILD_VERSION, build_epub
+from .matins import catalogues as matins_catalogues
 from .matins import config as matins_config
 from .matins import routes as matins_routes
 from .matins import scheduler as matins_scheduler
@@ -417,6 +418,18 @@ def _resolve_secret(secret: str, request: Request) -> str:
     return token
 
 
+def _wants_html(request: Request) -> bool:
+    """True when a browser asked for this catalogue, not a reader.
+
+    OPDS clients send `*/*` or an Atom type; browsers send `text/html` first.
+    Defaulting to the feed means a client that asks for nothing still gets
+    OPDS — the failure mode of guessing wrong in that direction is a broken
+    e-reader, and in the other direction it is a page a person can still read.
+    """
+    accept = request.headers.get("accept", "")
+    return "text/html" in accept and "application/atom+xml" not in accept
+
+
 def _feed_id(secret: str) -> str:
     # Stable per-user feed id that doesn't echo the secret itself
     return "urn:later-ink:u:" + hashlib.sha1(secret.encode()).hexdigest()[:12]
@@ -462,6 +475,7 @@ async def landing(request: Request, background_tasks: BackgroundTasks):
         config.get_stripe_payment_link(),
         config.allow_free_signup(),
         config.get_base_url(),
+        catalogues=matins_catalogues.read(request),
     )
 
 
@@ -607,6 +621,7 @@ async def start_get(session_id: str | None = Query(None)):
 
 @app.post("/start", response_class=HTMLResponse)
 async def start_post(
+    request: Request,
     # Optional since Matins: a catalogue can be feeds and saved links only.
     readwise_token: str = Form(""),
     session_id: str | None = Form(None),
@@ -634,7 +649,11 @@ async def start_post(
             status_code=403,
         )
     catalog_url = f"{config.get_base_url()}/{secret}/"
-    return pages.success(catalog_url, secret, _csrf_token(secret))
+    response = HTMLResponse(pages.success(catalog_url, secret, _csrf_token(secret)))
+    # So the landing page can say "your catalogues" instead of offering to
+    # create another one the next time this browser visits.
+    matins_catalogues.remember(secret, request, response)
+    return response
 
 
 # ------------------------------------------- single-user self-host mode
@@ -783,6 +802,10 @@ async def tenant_delete(secret: str, request: Request, csrf: str | None = Form(N
 @app.api_route("/{secret}/", methods=["GET", "HEAD"])
 async def tenant_root(secret: str, request: Request):
     _resolve_secret(secret, request)
+    if _wants_html(request):
+        response = HTMLResponse(matins_routes.dashboard(request, secret))
+        matins_catalogues.remember(secret, request, response)
+        return response
     c = await _tenant_connector(secret)
     entries = [
         *await _catalog_entries(c),

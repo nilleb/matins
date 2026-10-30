@@ -14,6 +14,7 @@ import hashlib
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,6 +33,19 @@ SAVED_SECTION = "Saved for later"
 # Used when a feed gives no word count at all. Low enough that a silent feed
 # cannot monopolise the budget, high enough that it is not excluded for free.
 DEFAULT_ITEM_WORDS = 400
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One thing that would go into the next issue, before it is fetched."""
+
+    source: str
+    article: object
+    section: str
+
+    @property
+    def estimated_words(self) -> int:
+        return getattr(self.article, "word_count", None) or DEFAULT_ITEM_WORDS
 
 
 class IssueService:
@@ -64,14 +78,15 @@ class IssueService:
         now: datetime | None = None,
     ) -> Issue | None:
         now = now or datetime.now(UTC)
-        candidates = await self._select(secret, reader, now)
+        candidates = await self.plan(secret, reader, now)
         logger.info("issue for %s on %s: %d candidates", _mask(secret), local_day, len(candidates))
         if not candidates:
             return None
 
         items: list[IssueItem] = []
-        printed: list[tuple[str, object, str]] = []
-        for source_name, article, section in candidates:
+        printed: list[Candidate] = []
+        for candidate in candidates:
+            source_name, article, section = candidate.source, candidate.article, candidate.section
             try:
                 _article, html = await reader.get_article_html(
                     reader.decorate_id(source_name, article.id)
@@ -92,7 +107,7 @@ class IssueService:
                     word_count=_words(html),
                 )
             )
-            printed.append((source_name, article, section))
+            printed.append(candidate)
 
         if not items:
             logger.info(
@@ -120,17 +135,17 @@ class IssueService:
             word_count=word_count,
             items=[
                 (
-                    reader.decorate_id(source, article.id),
-                    article.title,
-                    article.url,
-                    section,
+                    reader.decorate_id(c.source, c.article.id),
+                    c.article.title,
+                    c.article.url,
+                    c.section,
                 )
-                for source, article, section in printed
+                for c in printed
             ],
         )
         # Only mark consumed what actually made it into the file — a saved link
         # whose page failed to extract stays in the queue for tomorrow.
-        saved_ids = [int(article.id) for source, article, _ in printed if source == "later"]
+        saved_ids = [int(c.article.id) for c in printed if c.source == "later"]
         self.store.consume_saved(secret, saved_ids, issue_id)
         self._prune(secret)
         logger.info(
@@ -173,15 +188,18 @@ class IssueService:
         if delivery.email:
             await notify.send_issue_notification(delivery.email, issue, catalog_url)
 
-    async def _select(
-        self, secret: str, reader, now: datetime
-    ) -> list[tuple[str, object, str]]:
-        """Ordered (source, article, section) candidates.
+    async def plan(self, secret: str, reader, now: datetime | None = None) -> list[Candidate]:
+        """What the next issue would contain, without fetching anything.
+
+        Public because the preview page needs exactly this view: selection is
+        opinionated, and the user should be able to see the picks before the
+        service downloads and prints them.
 
         Saved items come first and are exempt from the per-feed cap: a link the
         user deliberately queued is a stronger signal than anything a feed
         pushed at them."""
-        selected: list[tuple[str, object, str]] = []
+        now = now or datetime.now(UTC)
+        selected: list[Candidate] = []
         budget = config.get_issue_max_words()
         max_articles = config.get_issue_max_articles()
 
@@ -195,7 +213,7 @@ class IssueService:
                 cost = article.word_count or DEFAULT_ITEM_WORDS
                 if selected and budget - cost < 0:
                     break
-                selected.append(("later", article, SAVED_SECTION))
+                selected.append(Candidate("later", article, SAVED_SECTION))
                 budget -= cost
 
         feeds = reader.sources.get("rss")
@@ -233,7 +251,7 @@ class IssueService:
                     cost = article.word_count or DEFAULT_ITEM_WORDS
                     if budget - cost < 0:
                         break
-                    selected.append(("rss", article, folder.title))
+                    selected.append(Candidate("rss", article, folder.title))
                     budget -= cost
                     per_feed += 1
 
