@@ -256,6 +256,44 @@ def test_two_catalogues_can_share_a_feed_url():
             clear_cache()
 
 
+def test_issue_images_do_not_collide_between_articles():
+    """Every document numbers its images from zero; in one book that means
+    chapter two silently overwrites chapter one's first image."""
+    import httpx
+
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+        "01f15c4890000000d49444154789c626001000000ffff030000060005"
+        "57bfabd40000000049454e44ae426082"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    items = [
+        IssueItem(
+            title=f"Article {n}",
+            html='<p>Body.</p><img src="https://example.com/pic.png">',
+            section="Feeds",
+        )
+        for n in (1, 2)
+    ]
+    built = asyncio.run(
+        build_issue(
+            title="Matins", issue_date=datetime(2026, 10, 30, 7, 0), items=items, image_client=client
+        )
+    )
+    with zipfile.ZipFile(io.BytesIO(built.result.data)) as zf:
+        images = sorted(n for n in zf.namelist() if n.startswith("EPUB/images/"))
+        chapters = [zf.read(n).decode() for n in zf.namelist() if n.startswith("EPUB/item_")]
+    assert len(images) == 2, images
+    assert len(set(images)) == 2
+    # Each chapter points at its own file, not at a shared one.
+    assert "c000-img0.png" in chapters[0]
+    assert "c001-img0.png" in chapters[1]
+
+
 # ------------------------------------------------------------------ webhooks
 
 

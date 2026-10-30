@@ -12,6 +12,7 @@ hardened HTML path as a single article.
 """
 
 import io
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from html import escape
@@ -37,6 +38,10 @@ from ..epub import (
 # on a slow e-ink radio in the morning.
 MAX_ISSUE_IMAGES = 90
 MAX_ISSUE_IMAGE_BYTES = 30 * 1024 * 1024
+# One wall-clock budget for the whole issue rather than per article: fifteen
+# articles each waiting out their own image phase is a download measured in
+# hours, and the reader is waiting for it.
+ISSUE_IMAGE_PHASE_BUDGET = 180.0
 
 
 @dataclass
@@ -84,6 +89,8 @@ async def build_issue(
     images_failed = False
     budget_exhausted = False
     fallback_used = False
+    image_deadline = time.monotonic() + ISSUE_IMAGE_PHASE_BUDGET
+    image_budget = MAX_ISSUE_IMAGE_BYTES
 
     try:
         for index, item in enumerate(items):
@@ -94,7 +101,19 @@ async def build_issue(
                     if parent is not None:
                         parent.remove(el)
                 _strip_active_content(doc)
-                embedded, failed, exhausted = await _embed_images(doc, client)
+                # Prefix per chapter: every document numbers its images from
+                # zero, so one book with fifteen articles would otherwise keep
+                # fifteen copies of `images/img0.png` and show the last one in
+                # all fifteen places.
+                embedded, failed, exhausted = await _embed_images(
+                    doc,
+                    client,
+                    prefix=f"c{index:03d}-",
+                    max_images=max(0, MAX_ISSUE_IMAGES - len(image_items)),
+                    max_total_bytes=image_budget,
+                    deadline=image_deadline,
+                )
+                image_budget -= sum(len(item.content) for item in embedded)
                 image_items.extend(embedded)
                 images_failed = images_failed or failed
                 budget_exhausted = budget_exhausted or exhausted

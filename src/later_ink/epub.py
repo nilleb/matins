@@ -101,7 +101,13 @@ def _fallback_html(title: str, source_url: str | None) -> str:
 
 
 async def _embed_images(
-    doc, client: httpx.AsyncClient
+    doc,
+    client: httpx.AsyncClient,
+    *,
+    prefix: str = "",
+    max_images: int = MAX_IMAGES,
+    max_total_bytes: int = MAX_IMAGE_BYTES_TOTAL,
+    deadline: float | None = None,
 ) -> tuple[list[epub.EpubItem], bool, bool]:
     """Fetch remote <img> targets and rewrite them to in-book paths.
 
@@ -120,12 +126,13 @@ async def _embed_images(
     total_bytes = 0
     images_failed = False
     budget_exhausted = False
-    deadline = time.monotonic() + IMAGE_PHASE_BUDGET
+    if deadline is None:
+        deadline = time.monotonic() + IMAGE_PHASE_BUDGET
     for i, img in enumerate(doc.iter("img")):
         src = img.get("src") or ""
         if not src.startswith(("http://", "https://")):
             continue
-        if len(items) >= MAX_IMAGES or total_bytes >= MAX_IMAGE_BYTES_TOTAL:
+        if len(items) >= max_images or total_bytes >= max_total_bytes:
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -138,7 +145,7 @@ async def _embed_images(
             client,
             src,
             timeout=min(IMAGE_FETCH_TIMEOUT, remaining),
-            max_bytes=min(MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_TOTAL - total_bytes),
+            max_bytes=min(MAX_IMAGE_BYTES, max_total_bytes - total_bytes),
             allowed_types=_IMAGE_TYPES,
         )
         if got is None:
@@ -151,10 +158,10 @@ async def _embed_images(
                 continue
         ext = _EXT_BY_TYPE[media_type]
         total_bytes += len(content)
-        file_name = f"images/img{i}.{ext}"
+        file_name = f"images/{prefix}img{i}.{ext}"
         items.append(
             epub.EpubItem(
-                uid=f"img{i}",
+                uid=f"{prefix}img{i}",
                 file_name=file_name,
                 media_type=media_type,
                 content=content,
