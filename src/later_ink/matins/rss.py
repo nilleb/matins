@@ -344,10 +344,17 @@ class RssConnector(Connector):
         )
 
     async def _load(self, feed: Feed) -> ParsedFeed:
+        # Keyed by feed, not by URL. Item ids embed the feed id, which is
+        # derived from the owning secret, so a URL-only cache would hand one
+        # catalogue a parsed feed whose ids belong to another — and every
+        # download would then fail with "that feed is no longer subscribed".
+        # Two users subscribing to the same site is the normal case, not an
+        # edge case.
+        key = f"{feed.id}|{feed.url}"
         now = time.monotonic()
-        cached = _cache.get(feed.url)
+        cached = _cache.get(key)
         if cached and now - cached[0] < _CACHE_TTL:
-            _cache.move_to_end(feed.url)
+            _cache.move_to_end(key)
             return cached[1]
         body = await fetch_feed(
             feed.url,
@@ -355,8 +362,8 @@ class RssConnector(Connector):
             max_bytes=config.get_feed_max_bytes(),
         )
         parsed = parse_feed(body, feed.url, feed.id)
-        _cache[feed.url] = (now, parsed)
-        _cache.move_to_end(feed.url)
+        _cache[key] = (now, parsed)
+        _cache.move_to_end(key)
         while len(_cache) > _CACHE_MAX:
             _cache.popitem(last=False)
         # Adopt the feed's own title once, so the catalogue reads like the site

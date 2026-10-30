@@ -217,6 +217,45 @@ def test_build_issue_is_deterministic_and_has_both_sections():
     assert first.result.data == second.result.data
 
 
+def test_two_catalogues_can_share_a_feed_url():
+    """The parsed-feed cache must not leak one catalogue's item ids into
+    another's: every download would 404 with "feed no longer subscribed"."""
+    import tempfile
+
+    from cryptography.fernet import Fernet
+
+    from later_ink.matins.rss import RssConnector
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = MatinsStore(f"{tmp}/app.db", Fernet(Fernet.generate_key()))
+        secret_a, secret_b = "cat-a", "cat-b"
+        feed_a = store.add_feed(secret_a, "https://example.com/feed")
+        feed_b = store.add_feed(secret_b, "https://example.com/feed")
+        assert feed_a.id != feed_b.id
+
+        async def fake_fetch(url, *, timeout, max_bytes):
+            return RSS_XML
+
+        import later_ink.matins.rss as rss_module
+
+        original = rss_module.fetch_feed
+        rss_module.fetch_feed = fake_fetch
+        clear_cache()
+        try:
+            a = RssConnector(store, secret_a)
+            b = RssConnector(store, secret_b)
+            articles_a, _ = asyncio.run(a.list_articles(feed_a.id))
+            articles_b, _ = asyncio.run(b.list_articles(feed_b.id))
+            assert articles_a[0].id != articles_b[0].id
+            # Each connector must resolve its own article id.
+            _, html_a = asyncio.run(a.get_article_html(articles_a[0].id))
+            _, html_b = asyncio.run(b.get_article_html(articles_b[0].id))
+            assert "Body text" in html_a and "Body text" in html_b
+        finally:
+            rss_module.fetch_feed = original
+            clear_cache()
+
+
 # ------------------------------------------------------------------ webhooks
 
 
