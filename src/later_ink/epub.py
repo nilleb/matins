@@ -64,7 +64,12 @@ _TOC_ATTR = "data-rw-epub-toc"
 # Pillow's cover JPEG encoding, ebooklib's OPF and nav layout, and zlib's
 # DEFLATE stream. Requirements are hash-pinned so those move only deliberately,
 # but upgrading one of them is a bump event just as much as editing this file.
-BUILD_VERSION = 1
+#
+# 2 (Matins): Pillow 12.3.0 -> 13.0.0, which changes the cover JPEG bytes and so
+# retires every cached EPUB — otherwise a device holding a cover from the old
+# encoder would see a different document for the same article and lose its
+# reading position.
+BUILD_VERSION = 2
 
 # Every ZIP entry is stamped with this instead of the build time. Two downloads
 # of the same article must be byte-identical or KOReader's kosync treats them
